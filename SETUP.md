@@ -8,7 +8,9 @@ personal library.
 
 1. Create a project at [supabase.com](https://supabase.com).
 2. Open the SQL Editor and run the contents of [`supabase/schema.sql`](supabase/schema.sql)
-   once, against your new project.
+   against your new project. Every statement is idempotent (`if not exists`,
+   `create or replace`, etc.), so whenever this file changes later, just
+   re-run the whole thing — no need to track down what's new.
 3. Go to **Project Settings -> API** and copy the **Project URL** and the
    **anon public** key.
 
