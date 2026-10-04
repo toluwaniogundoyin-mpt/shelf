@@ -1,29 +1,10 @@
 import { NextResponse } from "next/server";
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { createClient } from "@/lib/supabase/server";
-import { uploadBookFile } from "@/lib/google/drive";
 import { fetchBookMetadata } from "@/lib/book-metadata";
+import { detectBookFormat } from "@/lib/book-format";
 
-type Format = "pdf" | "epub";
-
-const MIME_TO_FORMAT: Record<string, Format> = {
-  "application/pdf": "pdf",
-  "application/epub+zip": "epub",
-};
-
-function detectFormat(file: File): Format | null {
-  if (MIME_TO_FORMAT[file.type]) return MIME_TO_FORMAT[file.type];
-  const lower = file.name.toLowerCase();
-  if (lower.endsWith(".pdf")) return "pdf";
-  if (lower.endsWith(".epub")) return "epub";
-  return null;
-}
-
-async function resolveCategoryId(
-  supabase: SupabaseClient,
-  userId: string,
-  name: string
-) {
+async function resolveCategoryId(supabase: SupabaseClient, userId: string, name: string) {
   const { data: existing } = await supabase
     .from("categories")
     .select("id")
@@ -43,6 +24,9 @@ async function resolveCategoryId(
   return created.id as string;
 }
 
+// Finalizes a book after its file has already been uploaded directly to
+// Drive from the browser (see /api/books/upload-session) — this endpoint
+// only ever handles small JSON metadata, never file bytes.
 export async function POST(request: Request) {
   const supabase = await createClient();
   const {
@@ -53,27 +37,24 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  const formData = await request.formData();
-  const file = formData.get("file");
-  const title = formData.get("title");
-  const author = formData.get("author");
-  const categoryName = formData.get("category");
-  const clientCoverRaw = formData.get("clientCover");
-  const clientCover =
-    typeof clientCoverRaw === "string" &&
-    clientCoverRaw.startsWith("data:image/") &&
-    clientCoverRaw.length < 2_000_000
-      ? clientCoverRaw
-      : null;
+  const body = await request.json().catch(() => null);
+  const title = body?.title;
+  const author = body?.author;
+  const categoryName = body?.category;
+  const driveFileId = body?.driveFileId;
+  const sizeBytes = body?.sizeBytes;
+  const fileName = body?.fileName;
+  const mimeType = body?.mimeType;
+  const clientCoverRaw = body?.clientCover;
 
-  if (!(file instanceof File) || file.size === 0) {
-    return NextResponse.json({ error: "A book file is required." }, { status: 400 });
-  }
   if (typeof title !== "string" || !title.trim()) {
     return NextResponse.json({ error: "A title is required." }, { status: 400 });
   }
+  if (typeof driveFileId !== "string" || !driveFileId) {
+    return NextResponse.json({ error: "Missing uploaded file reference." }, { status: 400 });
+  }
 
-  const format = detectFormat(file);
+  const format = detectBookFormat(typeof fileName === "string" ? fileName : "", mimeType);
   if (!format) {
     return NextResponse.json(
       { error: "Only PDF and EPUB files are supported." },
@@ -81,27 +62,22 @@ export async function POST(request: Request) {
     );
   }
 
-  let categoryId: string | null = null;
+  const clientCover =
+    typeof clientCoverRaw === "string" &&
+    clientCoverRaw.startsWith("data:image/") &&
+    clientCoverRaw.length < 2_000_000
+      ? clientCoverRaw
+      : null;
+
   try {
+    let categoryId: string | null = null;
     if (typeof categoryName === "string" && categoryName.trim()) {
       categoryId = await resolveCategoryId(supabase, user.id, categoryName.trim());
     }
 
     const trimmedTitle = title.trim();
     const trimmedAuthor = typeof author === "string" && author.trim() ? author.trim() : null;
-
-    const [{ driveFileId, sizeBytes }, metadata] = await Promise.all([
-      (async () => {
-        const buffer = Buffer.from(await file.arrayBuffer());
-        return uploadBookFile(user.id, {
-          name: file.name,
-          mimeType:
-            file.type || (format === "pdf" ? "application/pdf" : "application/epub+zip"),
-          buffer,
-        });
-      })(),
-      fetchBookMetadata(trimmedTitle, trimmedAuthor),
-    ]);
+    const metadata = await fetchBookMetadata(trimmedTitle, trimmedAuthor);
 
     const { data: book, error } = await supabase
       .from("books")
@@ -112,7 +88,7 @@ export async function POST(request: Request) {
         category_id: categoryId,
         format,
         drive_file_id: driveFileId,
-        file_size_bytes: sizeBytes,
+        file_size_bytes: typeof sizeBytes === "number" ? sizeBytes : null,
         cover_url: metadata?.coverUrl ?? clientCover,
         description: metadata?.description ?? null,
       })
@@ -123,8 +99,8 @@ export async function POST(request: Request) {
 
     return NextResponse.json({ book }, { status: 201 });
   } catch (error) {
-    console.error("Book upload failed", error);
-    const message = error instanceof Error ? error.message : "Upload failed.";
+    console.error("Book creation failed", error);
+    const message = error instanceof Error ? error.message : "Failed to save book.";
     return NextResponse.json({ error: message }, { status: 500 });
   }
 }
