@@ -1,9 +1,9 @@
-import { google } from "googleapis";
+import { google, drive_v3 } from "googleapis";
 import { createClient } from "@/lib/supabase/server";
 
 const APP_FOLDER_NAME = "Shelf Library";
 
-async function getAuthorizedDrive(userId: string) {
+async function getOAuthClient(userId: string) {
   const supabase = await createClient();
   const { data, error } = await supabase
     .from("user_google_tokens")
@@ -22,13 +22,15 @@ async function getAuthorizedDrive(userId: string) {
     process.env.GOOGLE_CLIENT_SECRET
   );
   oauth2Client.setCredentials({ refresh_token: data.refresh_token });
-
-  return google.drive({ version: "v3", auth: oauth2Client });
+  return oauth2Client;
 }
 
-async function getOrCreateAppFolderId(
-  drive: Awaited<ReturnType<typeof getAuthorizedDrive>>
-) {
+async function getAuthorizedDrive(userId: string) {
+  const auth = await getOAuthClient(userId);
+  return google.drive({ version: "v3", auth });
+}
+
+async function getOrCreateAppFolderId(drive: drive_v3.Drive) {
   const existing = await drive.files.list({
     q: `name='${APP_FOLDER_NAME}' and mimeType='application/vnd.google-apps.folder' and trashed=false`,
     fields: "files(id)",
@@ -49,24 +51,43 @@ async function getOrCreateAppFolderId(
   return created.data.id!;
 }
 
-export async function uploadBookFile(
+// Hands the browser a one-time, pre-authorized session URL so the file's
+// bytes stream straight to Google — never through our server — which avoids
+// any serverless request-body size limit for large PDFs/EPUBs.
+export async function createResumableUploadSession(
   userId: string,
-  file: { name: string; mimeType: string; buffer: Buffer }
+  file: { name: string; mimeType: string }
 ) {
-  const drive = await getAuthorizedDrive(userId);
+  const auth = await getOAuthClient(userId);
+  const drive = google.drive({ version: "v3", auth });
   const folderId = await getOrCreateAppFolderId(drive);
-  const { Readable } = await import("node:stream");
 
-  const response = await drive.files.create({
-    requestBody: { name: file.name, parents: [folderId] },
-    media: { mimeType: file.mimeType, body: Readable.from(file.buffer) },
-    fields: "id, size",
-  });
+  const { token } = await auth.getAccessToken();
+  if (!token) throw new Error("Could not obtain a Drive access token.");
 
-  return {
-    driveFileId: response.data.id!,
-    sizeBytes: Number(response.data.size ?? 0),
-  };
+  const response = await fetch(
+    "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&fields=id,size",
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json; charset=UTF-8",
+        "X-Upload-Content-Type": file.mimeType,
+      },
+      body: JSON.stringify({ name: file.name, parents: [folderId] }),
+    }
+  );
+
+  if (!response.ok) {
+    throw new Error(`Failed to start a Drive upload session (${response.status}).`);
+  }
+
+  const uploadUrl = response.headers.get("location");
+  if (!uploadUrl) {
+    throw new Error("Drive did not return an upload session URL.");
+  }
+
+  return uploadUrl;
 }
 
 export async function getBookFileStream(userId: string, driveFileId: string) {
